@@ -50,3 +50,53 @@ class AgentSkills:
             "messages": [*state["messages"], {"role": "assistant", "content": answer}],
             "product_results": sources,
         }
+
+    async def prepare_order(self, state: AgentState) -> dict:
+        """Generate order draft via LLM and return it for HITL confirmation."""
+        last_message: str = state["messages"][-1]["content"]
+        all_products: list[dict[str, object]] = self._product_service.get_all()
+
+        draft_result = await self._order_generator.generate(
+            last_message, all_products, history=state.get("messages", [])
+        )
+        draft: dict = {
+            "product_id": draft_result.product_id,
+            "product_name": draft_result.product_name,
+            "quantity": draft_result.quantity,
+            "total_price": draft_result.total_price,
+        }
+
+        answer = (
+            f"Here's your order summary:\n\n"
+            f"Product: {draft['product_name']}\n"
+            f"Quantity: {draft['quantity']}\n"
+            f"Total: ${draft['total_price']:.2f}\n\n"
+            f"Would you like to confirm this order? (yes/no)"
+        )
+
+        return {
+            "order": draft,
+            "order_confirmed": False,
+            "final_answer": answer,
+            "messages": [*state["messages"], {"role": "assistant", "content": answer}],
+        }
+
+    def track_order(self, state: AgentState) -> dict:
+        """Look up orders for the current session and return status."""
+        orders = self._order_service.find_orders(state["session_id"])
+
+        if not orders:
+            answer = "I couldn't find any orders for your session. Have you placed an order yet?"
+        else:
+            lines = []
+            for o in orders:
+                lines.append(
+                    f"Order {o['order_id']}: {o['product_name']} x{o['quantity']} - "
+                    f"${o['total_price']:.2f} | Status: {o['status']} | ETA: {o['eta']}"
+                )
+            answer = "Here are your orders:\n\n" + "\n".join(lines)
+
+        return {
+            "final_answer": answer,
+            "messages": [*state["messages"], {"role": "assistant", "content": answer}],
+        }
