@@ -1,3 +1,5 @@
+from langgraph.types import interrupt
+
 from app.agent.state import AgentState
 from app.llm.response_generator import OrderDraftGenerator, QaResponseGenerator
 from app.llm.skill_router import SkillRouter
@@ -27,7 +29,11 @@ class AgentSkills:
         self._order_service = order_service
 
     async def route_skill(self, state: AgentState) -> dict:
-        """Classify user intent: Q&A, Order, or Track."""
+        """Classify user intent: Q&A, Order, or Track.
+
+        Only runs for new messages - on HITL resume, LangGraph skips
+        the entry point and continues from the interrupt directly.
+        """
         last_message: str = state["messages"][-1]["content"]
         result = await self._skill_router.classify(last_message)
         return {"skill": result.skill}
@@ -52,7 +58,10 @@ class AgentSkills:
         }
 
     async def prepare_order(self, state: AgentState) -> dict:
-        """Generate order draft via LLM and return it for HITL confirmation."""
+        """Generate order draft via LLM and return it for HITL confirmation.
+
+        The actual confirmation pause happens in await_confirmation node.
+        """
         last_message: str = state["messages"][-1]["content"]
         all_products: list[dict[str, object]] = self._product_service.get_all()
 
@@ -77,6 +86,51 @@ class AgentSkills:
         return {
             "order": draft,
             "order_confirmed": False,
+            "final_answer": answer,
+            "messages": [*state["messages"], {"role": "assistant", "content": answer}],
+        }
+
+    def await_confirmation(self, state: AgentState) -> dict:
+        """Pause execution and wait for user confirmation via LangGraph interrupt.
+
+        On first pass: interrupt() pauses the graph, checkpointer persists state.
+        On resume: interrupt() returns the value from Command(resume=...).
+        """
+        user_response: str = interrupt("Waiting for order confirmation")
+
+        return {
+            "user_response": user_response,
+            "messages": [
+                *state["messages"],
+                {"role": "user", "content": user_response},
+            ],
+        }
+
+    def finalize_order(self, state: AgentState) -> dict:
+        """Process HITL confirmation and create or cancel the order."""
+        user_response: str = state.get("user_response", "")
+        confirmed: bool = user_response.lower().strip() in (
+            "yes",
+            "yeah",
+            "y",
+            "confirm",
+            "ok",
+            "okay",
+        )
+
+        order = state.get("order", {})
+        if confirmed:
+            order_id = self._order_service.create_order(state["session_id"], order)
+            answer = (
+                f"Order {order_id} confirmed! Your {order.get('product_name', 'item')} "
+                f"will be shipped within 2-3 business days. "
+                f"Order total: ${order.get('total_price', 0):.2f}"
+            )
+        else:
+            answer = "Order cancelled. Let me know if you need anything else."
+
+        return {
+            "order_confirmed": confirmed,
             "final_answer": answer,
             "messages": [*state["messages"], {"role": "assistant", "content": answer}],
         }
