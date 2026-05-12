@@ -16,6 +16,23 @@ class AgentGraph:
         self._skills = skills
 
     def build(self, checkpointer: BaseCheckpointSaver) -> StateGraph:
+        """Build and compile the LangGraph agent graph.
+
+        Requires a checkpointer for state persistence between turns.
+        In production: SqliteSaver / PostgresSaver. In tests: InMemorySaver.
+
+        Graph topology:
+
+        Q&A path:
+            route_skill ──(qa)──> search_products ──> generate_qa_answer ──> END
+
+        Order path (HITL via interrupt):
+            route_skill ──(order)──> prepare_order ──> await_confirmation ──> finalize_order ──> END
+                               drafts the order       interrupt()         processes response
+
+        Track path:
+            route_skill ──(track)──> track_order ──> END
+        """
         graph: StateGraph = StateGraph(AgentState)
 
         graph.add_node("route_skill", self._skills.route_skill)
@@ -48,6 +65,12 @@ class AgentGraph:
 
     @staticmethod
     def _route_after_skill(state: AgentState) -> str:
+        """Conditional edge after skill routing.
+
+        Q&A path: search products → generate answer
+        Order path: prepare order draft → interrupt for HITL confirmation
+        Track path: look up order status in the registry
+        """
         if state["skill"] == "order":
             return "prepare_order"
         if state["skill"] == "track":
