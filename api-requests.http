@@ -1,0 +1,140 @@
+### Flow 1: Q&A - product question
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "Tell me about laptops, what do you have?",
+  "session_id": "qa-demo"
+}
+
+### Flow 1: Q&A - follow-up, same session
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "Do you have any wireless headphones?",
+  "session_id": "qa-demo"
+}
+
+### Flow 1b: Semantic RAG - no keyword overlap (expects: UltraBook 13 Air)
+# "lightweight to carry while traveling" -> matches "ultraportable / lightweight",
+# even though the query never says "laptop". Keyword search would miss this.
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "I need something really light to carry around while traveling",
+  "session_id": "rag-demo"
+}
+
+### Flow 1b: Semantic RAG - intent, not keywords (expects: SlatePad Pro 11)
+# "take notes and sketch by hand" -> matches stylus support / drawing / note-taking.
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "What can I use to take notes and sketch by hand?",
+  "session_id": "rag-demo"
+}
+
+### Flow 1b: Semantic RAG - paraphrase (expects: Rugged Phone Go)
+# "survives being dropped in water" -> matches "water and dust resistant / IP68".
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "Which phone survives being dropped in water?",
+  "session_id": "rag-demo"
+}
+
+### Flow 1b: Semantic RAG - use case (expects: PulseFit Watch)
+# "track my running and heart rate" -> matches fitness smartwatch / GPS / heart rate.
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "I want to track my running and heart rate",
+  "session_id": "rag-demo"
+}
+
+### Flow 1b: Semantic RAG - problem statement (expects: AeroStand Aluminum)
+# "back hurts at my desk" -> matches "improves posture", zero shared keywords.
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "My back hurts when I work at my desk all day, any ideas?",
+  "session_id": "rag-demo"
+}
+
+### Flow 2: Order - HITL step 1: draft
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "I want to buy a ProBook 15",
+  "session_id": "order-demo"
+}
+
+### Flow 2: Order - HITL step 2: confirm
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "yes",
+  "session_id": "order-demo"
+}
+
+### Flow 2 (variant): Order - HITL step 1: draft
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "I want to buy BudgetPhone X",
+  "session_id": "order-cancel-demo"
+}
+
+### Flow 2 (variant): Order - HITL step 2: cancel
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "no",
+  "session_id": "order-cancel-demo"
+}
+
+### Guardrail: off-topic - should be rejected
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "What's the weather like today?",
+  "session_id": "guard-demo"
+}
+
+### Guardrail: empty message - Pydantic 422
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "",
+  "session_id": "guard-demo"
+}
+
+### Flow 3: Track order - check status (mock, needs a confirmed order first)
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "What is the status of my orders?",
+  "session_id": "order-demo"
+}
+
+### Flow 3: Track order - no orders placed yet
+POST {{host}}/chat
+Content-Type: application/json
+
+{
+  "message": "Track my shipment",
+  "session_id": "track-new"
+}
