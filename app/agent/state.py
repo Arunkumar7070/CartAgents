@@ -1,26 +1,23 @@
-from typing import NotRequired, TypedDict
-
-
-class OrderDraft(TypedDict):
-    product_id: str
-    product_name: str
-    quantity: int
-    total_price: float
+import operator
+from typing import Annotated, NotRequired, TypedDict
 
 
 class AgentState(TypedDict):
-    """State that flows through LangGraph nodes.
-
-    TypedDict is a lightweight alternative to Pydantic for graph state.
-    LangGraph copies this dict between nodes - each node returns a partial
-    update that gets merged into the accumulated state.
-    """
-
     session_id: str
-    messages: list[dict[str, str]]
-    skill: str
-    product_results: list[dict[str, object]]
-    order: NotRequired[OrderDraft]
-    order_confirmed: NotRequired[bool]
-    user_response: NotRequired[str]
-    final_answer: str
+    messages: Annotated[list[dict[str, str]], operator.add]
+    decision: dict | None
+    products: list[dict]
+    pending: dict | None
+    blocks: list[dict]
+    confirmation: NotRequired[str]
+
+
+def new_turn_input(session_id: str, message: str) -> AgentState:
+    return {
+        "session_id": session_id,
+        "messages": [{"role": "user", "content": message}],
+        "decision": None,
+        "products": [],
+        "pending": None,
+        "blocks": [],
+    }
