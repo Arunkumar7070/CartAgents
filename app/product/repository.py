@@ -1,108 +1,131 @@
-from abc import ABC, abstractmethod
+import re
+from dataclasses import dataclass
+
+from langchain_core.embeddings import Embeddings
+from psycopg_pool import AsyncConnectionPool
 
 from app.logger import setup_logger
-from app.product.catalog import load_products, products_by_id
 
 logger = setup_logger("retrieval")
 
+RRF_K = 60
+CANDIDATES_PER_RANKER = 20
 
-class ProductRepository(ABC):
-    """Interface for product data access.
+_PRODUCT_COLUMNS = "p.id, p.name, p.category, p.brand, p.price_cents, p.stock, p.specs, p.description"
 
-    The concrete implementation talks to a vector database for semantic search.
-    """
+_FILTER_CLAUSE = """
+    (%(category)s::text IS NULL OR p.category = %(category)s)
+    AND (%(brand)s::text IS NULL OR p.brand = %(brand)s)
+    AND (%(min_price_cents)s::int IS NULL OR p.price_cents >= %(min_price_cents)s)
+    AND (%(max_price_cents)s::int IS NULL OR p.price_cents <= %(max_price_cents)s)
+"""
 
-    @abstractmethod
-    def search(self, query: str) -> list[dict[str, object]]: ...
+_HYBRID_SEARCH_SQL = f"""
+WITH semantic AS (
+    SELECT p.id, row_number() OVER (ORDER BY e.embedding <=> %(embedding)s::vector) AS rank
+    FROM products p
+    JOIN product_embeddings e ON e.product_id = p.id AND e.embedding_model = %(embedding_model)s
+    WHERE {_FILTER_CLAUSE}
+    ORDER BY e.embedding <=> %(embedding)s::vector
+    LIMIT {CANDIDATES_PER_RANKER}
+),
+keyword AS (
+    SELECT p.id, row_number() OVER (ORDER BY ts_rank_cd(p.search_tsv, q) DESC) AS rank
+    FROM products p, to_tsquery('english', %(keywords)s) q
+    WHERE %(keywords)s <> '' AND p.search_tsv @@ q AND {_FILTER_CLAUSE}
+    LIMIT {CANDIDATES_PER_RANKER}
+)
+SELECT {_PRODUCT_COLUMNS},
+       coalesce(1.0 / ({RRF_K} + s.rank), 0) + coalesce(1.0 / ({RRF_K} + k.rank), 0) AS score
+FROM products p
+LEFT JOIN semantic s ON s.id = p.id
+LEFT JOIN keyword k ON k.id = p.id
+WHERE s.id IS NOT NULL OR k.id IS NOT NULL
+ORDER BY score DESC, p.id
+LIMIT %(top_k)s
+"""
 
-    @abstractmethod
-    def get_all(self) -> list[dict[str, object]]: ...
+
+@dataclass(frozen=True)
+class SearchFilters:
+    category: str | None = None
+    brand: str | None = None
+    min_price_cents: int | None = None
+    max_price_cents: int | None = None
+
+    def as_params(self) -> dict:
+        return {
+            "category": self.category,
+            "brand": self.brand,
+            "min_price_cents": self.min_price_cents,
+            "max_price_cents": self.max_price_cents,
+        }
+
+    def applied(self) -> list[dict]:
+        return [
+            {"field": field, "value": value} for field, value in self.as_params().items() if value is not None
+        ]
 
 
-class ChromaProductRepository(ProductRepository):
-    """Semantic product search backed by ChromaDB (RAG retrieval step).
+def keyword_query(text: str) -> str:
+    return " | ".join(dict.fromkeys(re.findall(r"[a-z0-9]{2,}", text.lower())))
 
-    The catalog is embedded once by the offline indexer (embedding/index.py) into
-    a remote ChromaDB collection. At query time the user's question is embedded
-    with the same model and the collection returns the top-k most similar products
-    by cosine distance — this is real retrieval, not keyword matching.
 
-    The ChromaDB client is connected lazily on first use so that importing this
-    module (and the DI container) never performs network I/O. Catalog metadata is
-    kept local: the collection returns ids, which we map back to full products.
-    """
+def embedding_literal(vector: list[float]) -> str:
+    return "[" + ",".join(f"{x:.7f}" for x in vector) + "]"
 
+
+class ProductRepository:
     def __init__(
-        self,
-        host: str,
-        port: int,
-        collection_name: str,
-        embedding_model: str = "text-embedding-3-small",
-        api_key_env_var: str = "OPENAI_API_KEY",
-        top_k: int = 3,
-        max_distance: float | None = None,
+        self, pool: AsyncConnectionPool, embeddings: Embeddings, embedding_model: str, top_k: int
     ) -> None:
-        self._host = host
-        self._port = port
-        self._collection_name = collection_name
+        self._pool = pool
+        self._embeddings = embeddings
         self._embedding_model = embedding_model
-        self._api_key_env_var = api_key_env_var
         self._top_k = top_k
-        # Optional relevance cutoff: drop hits whose cosine distance exceeds this.
-        # None keeps the raw top-k (Q&A always gets some context to work with).
-        self._max_distance = max_distance
-        self._by_id = products_by_id()
-        self._collection = None
 
-    def _get_collection(self):
-        """Connect to the remote ChromaDB collection (lazy, cached).
-
-        chromadb is imported here, not at module top level, so unit tests and the
-        DI container can run without the chromadb package or a live server.
-        """
-        if self._collection is not None:
-            return self._collection
-
-        import chromadb
-        from chromadb.utils import embedding_functions
-
-        # The query is embedded client-side with the same model used for indexing,
-        # so the server only ever stores and compares vectors (no API key needed there).
-        # The EF reads the key from the env var instead of holding the secret directly.
-        embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
-            api_key_env_var=self._api_key_env_var,
-            model_name=self._embedding_model,
+    async def search(self, query: str, filters: SearchFilters) -> list[dict]:
+        embedding = await self._embeddings.aembed_query(query)
+        params = {
+            **filters.as_params(),
+            "embedding": embedding_literal(embedding),
+            "embedding_model": self._embedding_model,
+            "keywords": keyword_query(query),
+            "top_k": self._top_k,
+        }
+        async with self._pool.connection() as conn:
+            rows = await (await conn.execute(_HYBRID_SEARCH_SQL, params)).fetchall()
+        logger.info(
+            "RETRIEVAL | top_k=%d | filters=%s | hits=%s",
+            self._top_k,
+            filters.applied(),
+            [(row["id"], round(float(row["score"]), 4)) for row in rows],
         )
-        client = chromadb.HttpClient(host=self._host, port=self._port)
-        # Pass the EF explicitly: get_collection otherwise defaults to a local ONNX
-        # model, which embeds queries with the wrong dimensions vs the index.
-        self._collection = client.get_collection(
-            name=self._collection_name,
-            embedding_function=embedding_fn,
+        return [{key: value for key, value in row.items() if key != "score"} for row in rows]
+
+    async def find(self, filters: SearchFilters) -> list[dict]:
+        sql = (
+            f"SELECT {_PRODUCT_COLUMNS} FROM products p WHERE {_FILTER_CLAUSE} "
+            "ORDER BY p.category, p.price_cents"
         )
-        return self._collection
+        async with self._pool.connection() as conn:
+            return await (await conn.execute(sql, filters.as_params())).fetchall()
 
-    def search(self, query: str) -> list[dict[str, object]]:
-        collection = self._get_collection()
-        result = collection.query(
-            query_texts=[query],
-            n_results=self._top_k,
-            include=["distances"],
-        )
-        ids = result["ids"][0]
-        distances = result["distances"][0]
+    async def get_many(self, product_ids: list[str]) -> dict[str, dict]:
+        sql = f"SELECT {_PRODUCT_COLUMNS} FROM products p WHERE p.id = ANY(%s)"
+        async with self._pool.connection() as conn:
+            rows = await (await conn.execute(sql, (product_ids,))).fetchall()
+        return {row["id"]: row for row in rows}
 
-        products: list[dict[str, object]] = []
-        for product_id, distance in zip(ids, distances, strict=True):
-            if self._max_distance is not None and distance > self._max_distance:
-                continue
-            product = self._by_id.get(product_id)
-            if product is not None:
-                products.append(product)
+    async def all(self) -> list[dict]:
+        return await self.find(SearchFilters())
 
-        hits = ", ".join(f"{pid} (d={dist:.3f})" for pid, dist in zip(ids, distances, strict=True))
-        logger.info("RETRIEVAL | query=%r | top_k=%d | %s", query, self._top_k, hits or "(none)")
-        return products
-
-    def get_all(self) -> list[dict[str, object]]:
-        return list(load_products())
+    async def embedded_product_count(self) -> int:
+        async with self._pool.connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT count(*) AS n FROM product_embeddings WHERE embedding_model = %s",
+                    (self._embedding_model,),
+                )
+            ).fetchone()
+        return row["n"]
