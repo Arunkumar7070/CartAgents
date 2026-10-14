@@ -1,36 +1,48 @@
 services:
-  # Vector database — hosted in its own container, persists embeddings to a volume.
-  chroma:
-    image: chromadb/chroma:1.5.9
-    ports:
-      # Host 8001 -> container 8000 to avoid clashing with the app on 8000.
-      - "8001:8000"
+  db:
+    image: pgvector/pgvector:0.8.1-pg17@sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21
     environment:
-      IS_PERSISTENT: "TRUE"
-      PERSIST_DIRECTORY: /data
-      ANONYMIZED_TELEMETRY: "FALSE"
+      POSTGRES_USER: cartagent
+      POSTGRES_PASSWORD: cartagent
+      POSTGRES_DB: cartagent
+    ports:
+      # Host 5433 avoids clashing with a locally installed Postgres on 5432.
+      - "5433:5432"
     volumes:
-      - chroma-data:/data
+      - pg-data:/var/lib/postgresql/data
+      - ./docker/create-test-db.sql:/docker-entrypoint-initdb.d/create-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cartagent -d cartagent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
-  ecommerce-agent:
+  migrate:
+    build: .
+    command: python -m app.db.migrate
+    environment:
+      DATABASE_URL: postgresql://cartagent:cartagent@db:5432/cartagent
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      # The app talks to Chroma over the compose network by service name.
-      CHROMA_HOST: chroma
-      CHROMA_PORT: "8000"
+      DATABASE_URL: postgresql://cartagent:cartagent@db:5432/cartagent
     depends_on:
-      - chroma
-    # Hot reload for development - watches app/ for changes
-    # Remove --reload and the volume mount for production
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      migrate:
+        condition: service_completed_successfully
+    command: uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --reload
     volumes:
       - ./app:/app/app
       - ./embedding:/app/embedding
+      - ./evaluation:/app/evaluation
       - ./data:/app/data
 
 volumes:
-  chroma-data:
+  pg-data:

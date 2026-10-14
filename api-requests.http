@@ -1,140 +1,89 @@
-### Flow 1: Q&A - product question
+### Health — 503 until `make index` has embedded the catalog
+GET {{host}}/health
+
+### Products — filtered browse, no LLM involved
+GET {{host}}/products?category=laptops&max_price_cents=150000
+
+### Q&A — first message creates a session; copy session_id from the response into http-client.env.json
 POST {{host}}/chat
 Content-Type: application/json
 
 {
-  "message": "Tell me about laptops, what do you have?",
-  "session_id": "qa-demo"
+  "message": "I need something really light to carry around while traveling"
 }
 
-### Flow 1: Q&A - follow-up, same session
+### Q&A — follow-up in the same session resolves "the cheaper one" from history
 POST {{host}}/chat
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "Do you have any wireless headphones?",
-  "session_id": "qa-demo"
+  "message": "Is there a cheaper one?"
 }
 
-### Flow 1b: Semantic RAG - no keyword overlap (expects: UltraBook 13 Air)
-# "lightweight to carry while traveling" -> matches "ultraportable / lightweight",
-# even though the query never says "laptop". Keyword search would miss this.
+### Order — draft; the response carries confirm_token
 POST {{host}}/chat
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "I need something really light to carry around while traveling",
-  "session_id": "rag-demo"
+  "message": "I want to buy two ProBook 15"
 }
 
-### Flow 1b: Semantic RAG - intent, not keywords (expects: SlatePad Pro 11)
-# "take notes and sketch by hand" -> matches stylus support / drawing / note-taking.
+### Order — confirm with the token from the draft
 POST {{host}}/chat
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "What can I use to take notes and sketch by hand?",
-  "session_id": "rag-demo"
+  "message": "yes please",
+  "confirm_token": "{{confirm_token}}"
 }
 
-### Flow 1b: Semantic RAG - paraphrase (expects: Rugged Phone Go)
-# "survives being dropped in water" -> matches "water and dust resistant / IP68".
+### Track
 POST {{host}}/chat
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "Which phone survives being dropped in water?",
-  "session_id": "rag-demo"
+  "message": "Where is my order?"
 }
 
-### Flow 1b: Semantic RAG - use case (expects: PulseFit Watch)
-# "track my running and heart rate" -> matches fitness smartwatch / GPS / heart rate.
+### Returns — cancel while processing (policy §1)
 POST {{host}}/chat
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "I want to track my running and heart rate",
-  "session_id": "rag-demo"
+  "message": "I changed my mind, cancel my order"
 }
 
-### Flow 1b: Semantic RAG - problem statement (expects: AeroStand Aluminum)
-# "back hurts at my desk" -> matches "improves posture", zero shared keywords.
+### Compare
 POST {{host}}/chat
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "My back hurts when I work at my desk all day, any ideas?",
-  "session_id": "rag-demo"
+  "message": "Compare the ProBook 15 and the UltraBook 13 Air"
 }
 
-### Flow 2: Order - HITL step 1: draft
-POST {{host}}/chat
+### Streaming — server-sent events: session, step, delta, done
+POST {{host}}/chat/stream
 Content-Type: application/json
+X-Session-Id: {{session}}
 
 {
-  "message": "I want to buy a ProBook 15",
-  "session_id": "order-demo"
+  "message": "Wireless headphones under $150"
 }
 
-### Flow 2: Order - HITL step 2: confirm
+### Orders for this session
+GET {{host}}/orders
+X-Session-Id: {{session}}
+
+### Off-topic — refused by the router
 POST {{host}}/chat
 Content-Type: application/json
 
 {
-  "message": "yes",
-  "session_id": "order-demo"
-}
-
-### Flow 2 (variant): Order - HITL step 1: draft
-POST {{host}}/chat
-Content-Type: application/json
-
-{
-  "message": "I want to buy BudgetPhone X",
-  "session_id": "order-cancel-demo"
-}
-
-### Flow 2 (variant): Order - HITL step 2: cancel
-POST {{host}}/chat
-Content-Type: application/json
-
-{
-  "message": "no",
-  "session_id": "order-cancel-demo"
-}
-
-### Guardrail: off-topic - should be rejected
-POST {{host}}/chat
-Content-Type: application/json
-
-{
-  "message": "What's the weather like today?",
-  "session_id": "guard-demo"
-}
-
-### Guardrail: empty message - Pydantic 422
-POST {{host}}/chat
-Content-Type: application/json
-
-{
-  "message": "",
-  "session_id": "guard-demo"
-}
-
-### Flow 3: Track order - check status (mock, needs a confirmed order first)
-POST {{host}}/chat
-Content-Type: application/json
-
-{
-  "message": "What is the status of my orders?",
-  "session_id": "order-demo"
-}
-
-### Flow 3: Track order - no orders placed yet
-POST {{host}}/chat
-Content-Type: application/json
-
-{
-  "message": "Track my shipment",
-  "session_id": "track-new"
+  "message": "Write me a Python script that scrapes a website"
 }

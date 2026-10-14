@@ -1,85 +1,60 @@
-"""Offline embedding indexer — builds the ChromaDB product collection.
-
-Run once (and again whenever the catalog changes) with `make index`. It reads the
-canonical catalog, embeds each product with OpenAI, and upserts the vectors into a
-remote ChromaDB collection. The running app never builds the index itself — it only
-queries the collection at request time.
-
-This separation mirrors a real RAG pipeline: indexing is a batch job, retrieval is
-online. Keeping it out of the request path means startup stays fast and embeddings
-are computed exactly once.
-
-Usage:
-    python -m embedding.index
-"""
-
-import os
+import asyncio
 import sys
 
-import chromadb
-from chromadb.utils import embedding_functions
+import psycopg
+from dotenv import load_dotenv
+from langchain_core.embeddings import Embeddings
 
-from app.product.catalog import load_products
+from app.config.settings import Settings
+from app.llm.gemini import build_embeddings
+from app.product.catalog import load_catalog
+from app.product.repository import embedding_literal
+
+_UPSERT_PRODUCT_SQL = """
+INSERT INTO products (id, name, category, brand, price_cents, stock, specs, description)
+VALUES (%(id)s, %(name)s, %(category)s, %(brand)s, %(price_cents)s, %(stock)s, %(specs)s, %(description)s)
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name, category = EXCLUDED.category, brand = EXCLUDED.brand,
+    price_cents = EXCLUDED.price_cents, stock = EXCLUDED.stock,
+    specs = EXCLUDED.specs, description = EXCLUDED.description
+"""
+
+_UPSERT_EMBEDDING_SQL = """
+INSERT INTO product_embeddings (product_id, embedding_model, embedding)
+VALUES (%s, %s, %s::vector)
+ON CONFLICT (product_id, embedding_model) DO UPDATE SET embedding = EXCLUDED.embedding
+"""
 
 
 def product_to_text(product: dict) -> str:
-    """Flatten a product into the text that gets embedded.
-
-    Only the semantically meaningful fields are included — name, category, brand
-    and the free-text fields. Price and stock are noise for similarity search.
-    """
     fields = ("name", "category", "brand", "specs", "description")
-    return " | ".join(str(product.get(field, "")) for field in fields)
+    return " | ".join(str(product[field]) for field in fields)
 
 
-def build_index() -> None:
-    host = os.environ.get("CHROMA_HOST", "localhost")
-    port = int(os.environ.get("CHROMA_PORT", "8000"))
-    collection_name = os.environ.get("CHROMA_COLLECTION", "products")
-    embedding_model = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        sys.exit("OPENAI_API_KEY is not set — cannot create embeddings.")
-
-    products = load_products()
-    print(f"Loaded {len(products)} products from the catalog.")
-
-    # Point the EF at the env var holding the key instead of passing the secret
-    # directly. Embedding runs client-side (here).
-    embedding_fn = embedding_functions.OpenAIEmbeddingFunction(
-        api_key_env_var="OPENAI_API_KEY",
-        model_name=embedding_model,
-    )
-
-    client = chromadb.HttpClient(host=host, port=port)
-    print(f"Connected to ChromaDB at {host}:{port}.")
-
-    # Recreate the collection from scratch so re-indexing is idempotent.
-    try:
-        client.delete_collection(collection_name)
-        print(f"Dropped existing collection '{collection_name}'.")
-    except Exception:
-        # Collection did not exist yet — nothing to drop on a first run.
-        pass
-
-    collection = client.create_collection(
-        name=collection_name,
-        embedding_function=embedding_fn,
-        # Cosine distance is the standard metric for normalized text embeddings.
-        configuration={"hnsw": {"space": "cosine"}},
-    )
-
-    # Embedding happens here: passing documents lets the embedding function turn
-    # each product text into a vector before storing it in the collection.
-    collection.add(
-        ids=[p["id"] for p in products],
-        documents=[product_to_text(p) for p in products],
-        metadatas=[{"name": p["name"], "category": p["category"]} for p in products],
-    )
-
-    print(f"Indexed {collection.count()} products into '{collection_name}' (model: {embedding_model}).")
+async def build_index(database_url: str, embeddings: Embeddings, embedding_model: str) -> int:
+    products = load_catalog()
+    vectors = await embeddings.aembed_documents([product_to_text(p) for p in products])
+    async with await psycopg.AsyncConnection.connect(database_url) as conn, conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.executemany(_UPSERT_PRODUCT_SQL, products)
+            await cur.executemany(
+                _UPSERT_EMBEDDING_SQL,
+                [
+                    (p["id"], embedding_model, embedding_literal(v))
+                    for p, v in zip(products, vectors, strict=True)
+                ],
+            )
+    return len(products)
 
 
 if __name__ == "__main__":
-    build_index()
+    load_dotenv()
+    settings = Settings.from_env()
+    count = asyncio.run(
+        build_index(
+            settings.database_url,
+            build_embeddings(settings.google_api_key, settings.embedding_model),
+            settings.embedding_model,
+        )
+    )
+    print(f"Indexed {count} products with {settings.embedding_model}.", file=sys.stderr)

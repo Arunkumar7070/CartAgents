@@ -1,32 +1,29 @@
-FROM python:3.11-slim
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.17@sha256:03bdc89bb9798628846e60c3a9ad19006c8c3c724ccd2985a33145c039a0577b /uv /usr/local/bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install uv - fast Python package manager
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-# Install dependencies in a separate layer - cache hit when deps don't change
-COPY pyproject.toml .
-RUN uv pip install --system --no-cache \
-    fastapi \
-    "uvicorn[standard]" \
-    pydantic \
-    langgraph \
-    langgraph-checkpoint-sqlite \
-    aiosqlite \
-    langchain-openai \
-    python-dotenv \
-    "chromadb>=1.5.9,<2.0.0"
-
-# Copy application code, the offline embedding indexer, and the product catalog
 COPY app/ app/
 COPY embedding/ embedding/
+COPY evaluation/ evaluation/
 COPY data/products.json data/products.json
 
-# Run as non-root user
-RUN useradd --create-home appuser && mkdir -p data && chown appuser:appuser data
+RUN useradd --create-home appuser
 USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://localhost:{os.environ.get(\"PORT\", \"8000\")}/health')"
+
+CMD ["sh", "-c", "exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port ${PORT:-8000}"]

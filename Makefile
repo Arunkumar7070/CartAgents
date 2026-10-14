@@ -1,4 +1,4 @@
-.PHONY: build up down logs index inspect-documents inspect-embeddings test lint format clean eval
+.PHONY: build up down logs migrate index test lint format clean eval web
 
 build:
 	docker compose build
@@ -6,35 +6,35 @@ build:
 up:
 	docker compose up
 
-# Build the vector index — embeds the catalog into ChromaDB. Run once after `make up`
-# (and again whenever data/products.json changes). Starts the chroma service if needed.
-index:
-	docker compose run --rm ecommerce-agent python -m embedding.index
-
-# Inspect what's stored in ChromaDB (read-only, no OpenAI key needed).
-inspect-documents:
-	docker compose run --rm ecommerce-agent python -m embedding.inspect --mode documents
-
-inspect-embeddings:
-	docker compose run --rm ecommerce-agent python -m embedding.inspect --mode embeddings
-
 down:
 	docker compose down
 
 logs:
 	docker compose logs -f
 
+migrate:
+	docker compose run --rm migrate
+
+# Embeds the catalog into Postgres. Re-run whenever data/products.json or the embedding model changes.
+index:
+	docker compose run --rm api python -m embedding.index
+
 test:
-	python -m pytest tests/ -v
+	docker compose up -d --wait db
+	uv run pytest tests/ -v
 
 lint:
-	ruff check app/ embedding/ tests/
+	uv run ruff check app/ embedding/ evaluation/ tests/
+	uv run ruff format --check app/ embedding/ evaluation/ tests/
 
 format:
-	ruff format app/ embedding/ tests/
+	uv run ruff format app/ embedding/ evaluation/ tests/
 
 eval:
-	python -m evaluation.skill_router_eval
+	uv run python -m evaluation.skill_router_eval
+
+web:
+	cd frontend && npm run dev
 
 clean:
 	docker compose down -v
