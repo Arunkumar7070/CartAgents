@@ -9,3 +9,6 @@ __pycache__
 *.md
 docs/
 tests/
+frontend/
+.github/
+docker/

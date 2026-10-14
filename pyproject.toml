@@ -1,18 +1,18 @@
 [project]
 name = "ecommerce-ai-agent"
 version = "0.2.0"
-description = "E-commerce AI Agent - FastAPI + LangGraph + OpenAI ChatGPT"
-requires-python = ">=3.11"
+description = "E-commerce AI Agent - FastAPI + LangGraph + Google Gemini"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "pydantic>=2.10.0",
-    "langgraph>=0.3.0",
-    "langgraph-checkpoint-sqlite>=2.0.0",
-    "aiosqlite>=0.20.0",
-    "langchain-openai>=1.0.0",
+    "langgraph>=1.0.10",
+    "langgraph-checkpoint>=4.1.1",
+    "langgraph-checkpoint-postgres>=3.1.1",
+    "psycopg[binary,pool]>=3.2.0",
+    "langchain-google-genai>=4.4.0",
     "python-dotenv>=1.0.0",
-    "chromadb>=1.5.9,<2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +25,7 @@ dev = [
 
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]

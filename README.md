@@ -1,333 +1,114 @@
-# CartAgent - Agentic RAG + HITL
+# CartAgent
 
+A conversational shopping assistant built with **FastAPI**, **LangGraph**, **Google Gemini** and **Postgres + pgvector**, with a React front end styled as a till receipt.
 
+The design starts from documented failures of shopping chatbots. In *Moffatt v. Air Canada* (2024) an airline was held liable for a refund policy its chatbot made up. A Chevrolet dealer's bot was talked into "agreeing" to sell a car for $1. CartAgent is built so that cannot happen here:
 
-A **multi-skill AI agent** built with **FastAPI**, **LangGraph**, **OpenAI ChatGPT**, and **ChromaDB**. The agent routes each request to the right skill - Q&A (RAG), Order (HITL), or Track - and orchestrates the full conversation flow. 7 nodes, 3 skills, 1 checkpointer, ChromaDB-backed semantic retrieval.
+- **The LLM never produces a price.** Carts, totals, shipping and tax are computed in code from the catalog. Any dollar amount in a written answer that is not in the retrieved data causes that answer to be replaced.
+- **Policy decisions are made in code and cited.** Cancellation and return eligibility is a pure function over the order and the clock, and every reply quotes the clause it relied on (`[§3]`).
+- **Nothing irreversible happens without a human.** Orders, cancellations and returns pause the graph (LangGraph `interrupt`) until the customer approves. The approval must carry a one-time token bound to that pending action.
 
-## Skills
+## What it can do
 
-Each **skill** is a dedicated path through the LangGraph state graph. An LLM classifier picks the right one on every request:
+| Skill | Example | What happens |
+|-------|---------|--------------|
+| Q&A (hybrid RAG) | "wireless headphones under $150" | Router extracts filters → pgvector + full-text search fused with RRF → Gemini answers from the hits |
+| Order (HITL) | "two of the ProBook please" | Router resolves products from history → cart priced in code → approve → stock reserved in a transaction |
+| Track | "where is my order?" | Orders for the session, with a simulated processing → shipped → delivered clock |
+| Returns (HITL) | "cancel my order" / "I want a refund" | Eligibility checked against the returns policy → cited → approve → status updated |
+| Compare | "ProBook vs UltraBook" | Side-by-side rows built from catalog data, with differing values marked |
 
-| Skill | Trigger | What happens |
-|-------|---------|-------------|
-| **Q&A (RAG)** | "Tell me about laptops" | Classify → search catalog → LLM composes answer from results |
-| **Order (HITL)** | "I want to buy a ProBook 15" | LLM extracts product → draft → interrupt → confirm → place |
-| **Track** | "Where is my order?" | Look up order registry by session → return status + ETA |
-
-Adding a new skill means adding one node + one edge - zero changes to existing skills.
-
-Every request passes through **input and output guardrails** (LLM-based validation) before reaching the agent and before returning to the user.
-
-## Architecture highlights
-
-- **Multi-skill agent** - LLM-powered skill router classifies intent, conditional edges route to the right skill path
-- **Agentic RAG** - the agent decides when to run semantic retrieval (not every request goes through the vector store)
-- **Real RAG with ChromaDB** - offline indexing (embed the catalog once) + online retrieval (embed the query, top-k by cosine distance); vectors live in a separate ChromaDB container
-- **Human-in-the-Loop** - orders require explicit user confirmation via LangGraph's native `interrupt()` / `Command(resume=...)` pattern
-- **Persistent state** - graph execution state survives server restarts (SQLite checkpointer)
-- **Package-by-feature** - `product/` and `order/` domains each own their repository (ABC interface — ChromaDB for products, in-memory for orders) and service layer
-- **Structured logging** - per-request timing breakdown: guardrail latency, graph execution time, total request duration; retrieval logs top-k hits with cosine distances
-
-## RAG pipeline (index + retrieval)
-
-Two separate phases share the same ChromaDB collection and the same embedding model. **Indexing** is an offline batch job (`make index`); **retrieval** runs online per request. Embeddings are computed client-side — the ChromaDB server only stores and compares vectors.
-
-```mermaid
-flowchart LR
-    subgraph Offline["① Indexing — offline (make index, run once)"]
-        Cat[data/products.json<br/>20 products] --> Idx[embedding/index.py]
-        Idx -->|embed each product| EmbA[OpenAI<br/>text-embedding-3-small]
-        EmbA -->|vectors| Coll[("ChromaDB<br/>collection 'products'<br/>cosine / HNSW")]
-    end
-
-    subgraph Online["② Retrieval — online (per /chat request)"]
-        Q[User query] --> EmbB[OpenAI<br/>text-embedding-3-small]
-        EmbB -->|query vector| Coll
-        Coll -->|top-k by cosine distance| Hits[top-k product ids]
-        Hits --> Map[map ids → catalog]
-        Map -->|context| Gen[generate_qa_answer<br/>LLM composes answer]
-        Gen --> Ans[Answer + sources]
-    end
-
-    style Offline fill:#eef2f7,stroke:#5b6b8c,color:#1a1a2e
-    style Online fill:#eaf3ec,stroke:#3a7d54,color:#1a1a2e
-    style Coll fill:#533483,color:#fff
-```
-
-## Agent graph (7 nodes, 3 paths)
-
-```mermaid
-flowchart LR
-    Start(( )) --> Router[route_skill<br/>LLM: qa / order / track]
-
-    Router -- "qa" --> Search[search_products<br/>ChromaDB top-k]
-    Search --> GenQA[generate_qa_answer<br/>LLM RAG]
-    GenQA --> End1(( ))
-
-    Router -- "order" --> Prep[prepare_order<br/>LLM draft]
-    Prep --> Await[await_confirmation<br/>⏸️ interrupt]
-    Await -- "⏯️ resume" --> Final[finalize_order]
-    Final --> End2(( ))
-
-    Router -- "track" --> Track[track_order]
-    Track --> End3(( ))
-
-    style Router fill:#533483,color:#fff
-    style Search fill:#1a1a2e,color:#fff,stroke:#0f3460
-    style GenQA fill:#16213e,color:#fff
-    style Prep fill:#16213e,color:#fff
-    style Await fill:#e94560,color:#fff
-    style Final fill:#16213e,color:#fff
-    style Track fill:#1a1a2e,color:#fff,stroke:#0f3460
-```
+Each turn costs at most **two** Gemini calls: one structured routing decision, which also does the on-topic check and extracts filters, products and order ids, and one written answer, made only for Q&A. Every other skill is deterministic.
 
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph Client[" "]
-        User[User]
+flowchart LR
+    UI[React + Vite<br/>Vercel] -- "POST /chat/stream (SSE)" --> API[FastAPI<br/>Render]
+    API --> Graph
+
+    subgraph Graph[LangGraph agent]
+        Route[route_skill<br/>Gemini structured output] -->|qa| Search[search_products<br/>hybrid RRF] --> Answer[generate_qa_answer<br/>Gemini + grounding check]
+        Route -->|order| Prep[prepare_order<br/>price in code]
+        Route -->|returns| Ret[prepare_return<br/>policy check]
+        Route -->|track| Track[track_order]
+        Route -->|compare| Cmp[compare_products]
+        Prep --> Wait[await_confirmation<br/>interrupt]
+        Ret --> Wait
+        Wait -->|unclear| Clarify[clarify_confirmation] --> Wait
+        Wait -->|yes / no| Final[finalize_action<br/>re-verify cart hash]
     end
 
-    subgraph FastAPI["FastAPI"]
-        Main[main.py]
-        GuardIn[Input Guardrail]
-        GuardOut[Output Guardrail]
-        Logger[Structured Logger]
-    end
-
-    subgraph LangGraph["LangGraph Agent"]
-        Router[route_skill<br/>LLM classifier]
-        QA1[search_products]
-        QA2[generate_qa_answer<br/>LLM]
-        Ord1[prepare_order<br/>LLM draft]
-        Ord2[await_confirmation<br/>interrupt]
-        Ord3[finalize_order]
-        Track[track_order]
-        CP[("Checkpointer<br/>SQLite")]
-    end
-
-    subgraph LLM["LLM Layer (OpenAI)"]
-        OpenAI[ChatGPT<br/>gpt-4o-mini]
-        Embed[Embeddings<br/>text-embedding-3-small]
-    end
-
-    subgraph Domains["Domain Packages"]
-        Product[product/<br/>ChromaProductRepository + Service]
-        Order[order/<br/>InMemory Repository + Service]
-    end
-
-    subgraph Vector["Vector store (separate container)"]
-        Chroma[("ChromaDB<br/>collection 'products'")]
-    end
-
-    subgraph Offline["Offline indexing (make index)"]
-        Catalog[data/products.json] --> Indexer[embedding/index.py]
-    end
-
-    User -->|"POST /chat"| Main
-    Main --> GuardIn
-    GuardIn -->|allowed| Router
-    GuardIn -->|blocked| User
-    Router --> QA1 --> QA2
-    Router --> Ord1 --> Ord2 --> Ord3
-    Router --> Track
-    QA2 --> GuardOut --> User
-    Ord3 --> GuardOut --> User
-    Track --> GuardOut --> User
-    QA2 -.->|LLM call| OpenAI
-    Ord1 -.->|LLM call| OpenAI
-    Router -.->|LLM call| OpenAI
-    GuardIn -.->|LLM call| OpenAI
-    GuardOut -.->|LLM call| OpenAI
-    LangGraph --> CP
-    QA1 --> Product
-    Ord1 --> Product
-    Ord3 --> Order
-    Track --> Order
-    Product -->|"semantic search (top-k)"| Chroma
-    Product -.->|embed query| Embed
-    Indexer -.->|embed catalog| Embed
-    Indexer -->|store vectors| Chroma
-
-    style Client fill:#f0f0f3,stroke:#888,color:#1a1a2e
-    style FastAPI fill:#e8eef7,stroke:#5b6b8c,color:#1a1a2e
-    style LangGraph fill:#efeaf8,stroke:#7a6aa8,color:#1a1a2e
-    style LLM fill:#f7eef0,stroke:#b06a80,color:#1a1a2e
-    style Domains fill:#eef5ee,stroke:#5b8c6b,color:#1a1a2e
-    style Vector fill:#f7f1e0,stroke:#b09a4a,color:#1a1a2e
-    style Offline fill:#f0f0f3,stroke:#888,color:#1a1a2e
+    Graph --> PG[(Postgres + pgvector<br/>Neon)]
+    Route -.-> Gemini[Gemini 3.5 Flash-Lite]
+    Search -.-> Emb[gemini-embedding-001<br/>768 dims]
 ```
 
-## HITL flow (LangGraph interrupt / resume)
+All state lives in one Postgres database: products with their 768-dimension embeddings, a generated `tsvector` for keyword search, LangGraph checkpoints, sessions, orders with order lines, and the daily LLM usage counter. Locally it runs in the `pgvector/pgvector` container; in production it runs on Neon.
 
-```mermaid
-sequenceDiagram
-    actor User
-    box FastAPI + LangGraph
-        participant Main as main.py
-        participant Graph as Agent Graph
-        participant CP as Checkpointer (SQLite)
-    end
+### Abuse and safety controls
 
-    User->>Main: POST "I want to buy a ProBook 15"
-    Main->>CP: get_state(config)
-    CP-->>Main: next=() → new run
-    Main->>Graph: ainvoke(initial_state, config)
-    activate Graph
-    Graph->>Graph: route_skill → "order"
-    Graph->>Graph: prepare_order → draft
-    Graph->>Graph: await_confirmation → interrupt()
-    Graph-->>CP: save state
-    deactivate Graph
-    CP-->>Main: next=("await_confirmation",)
-    Main-->>User: "Confirm? ProBook 15 - $1299.99 (yes/no)"
+- Session ids are 256-bit random tokens issued by the server and sent in the `X-Session-Id` header. A client-made or unknown id is rejected, so one visitor cannot read or confirm another visitor's orders.
+- Each LLM call first takes an atomic slot from both a per-session cap and a global daily cap. When either runs out, the API returns `429` with `Retry-After`.
+- A per-IP token bucket keys on the right-most `X-Forwarded-For` entry only when `TRUST_PROXY=true`.
+- At most 20 streams run concurrently and one per session, each with a 60-second timeout.
+- Prompts mark catalog and conversation text as data, not instructions. Router output is checked against the catalog: unknown ids, brands and categories are dropped, and quantities and prices are clamped.
+- Model markdown is rendered without raw HTML, images or non-https links, under a strict CSP.
+- Prompts are not logged unless `LOG_PROMPTS=true`; logs carry a hashed session reference.
 
-    User->>Main: POST "yes"
-    Main->>CP: get_state(config)
-    CP-->>Main: next=("await_confirmation",) → resume
-    Main->>Graph: ainvoke(Command(resume="yes"), config)
-    activate Graph
-    Graph->>Graph: ⏯️ resume await_confirmation
-    Graph->>Graph: finalize_order → place order
-    Graph-->>CP: save state
-    deactivate Graph
-    CP-->>Main: next=() → done
-    Main-->>User: "Order ORD-1000 confirmed!"
+## Quick start
+
+Requirements: Docker, [uv](https://docs.astral.sh/uv/), Node 20+, and a free [Gemini API key](https://aistudio.google.com/apikey).
+
+```bash
+cp .env.example .env          # set GOOGLE_API_KEY
+make build && make up         # Postgres on :5433, migrations, API on :8000
+make index                    # embed the catalog into pgvector (run in a second terminal)
+
+cd frontend && cp .env.example .env && npm install && npm run dev   # http://localhost:5173
 ```
+
+`/health` returns `503` until `make index` has stored embeddings for the configured model. If you change `GEMINI_EMBEDDING_MODEL`, re-run `make index`; vectors are keyed by model, so the old ones stay and rolling back is just switching the variable back.
+
+## Development
+
+```
+make test     start Postgres and run the backend suite (real database; LLM and embeddings faked)
+make lint     ruff check + format check
+make eval     live router benchmark against Gemini; writes evaluation/results.json, served at /evals
+make migrate  apply app/db/schema.sql and the checkpoint tables
+cd frontend && npm test && npm run e2e    Vitest + axe, Playwright against a mocked stream
+```
+
+## Deploying for free
+
+| Piece | Host | Notes |
+|-------|------|-------|
+| Database | [Neon](https://neon.com) free | pgvector included; suspends when idle |
+| API | [Render](https://render.com) free web service, from `render.yaml` | Sleeps after 15 minutes idle; the UI shows a "warming the printer" banner during the cold start of about a minute |
+| Front end | [Vercel](https://vercel.com) Hobby, root directory `frontend/` | Static build; the CSP in `vercel.json` allows only the API origin |
+
+1. Create a Neon project. Using the owner connection string, run `DATABASE_URL=<owner-url> uv run python -m app.db.migrate`, then `DATABASE_URL=<owner-url> uv run python -m embedding.index`.
+2. Create a `cart_app` role in Neon, run `app/db/grants.sql` as the owner, and use the `cart_app` connection string for the API. The runtime role cannot change the schema.
+3. On Render, create a Blueprint from this repo. Set `GOOGLE_API_KEY`, `DATABASE_URL` (the `cart_app` URL) and `CORS_ORIGINS` (your Vercel URL).
+4. On Vercel, import the repo with root directory `frontend` and set `VITE_API_URL` to the Render URL. If Render gives your service a different hostname than `cartagent-api.onrender.com`, update `connect-src` in `frontend/vercel.json`.
+
+The Gemini free tier may use prompts to improve Google's products and is not available for apps served to users in the EEA, UK or Switzerland. This demo uses invented products and orders, and the UI says so.
 
 ## Project structure
 
 ```
 app/
-├── agent/          # LangGraph graph (AgentGraph), skills (AgentSkills), state
-├── config/         # DI wiring — module-level singletons (di.py)
-├── product/        # ProductRepository (ABC + ChromaDB) + ProductService + catalog loader
-├── order/          # OrderRepository (ABC + InMemory) + OrderService
-├── llm/            # LlmClient, prompts, guardrail, skill router, response generators
-├── main.py         # FastAPI entry point + lifespan
-├── models.py       # Pydantic request/response
-└── logger.py       # Structured logging with timing
-embedding/
-├── index.py        # Offline RAG indexer — embeds the catalog into ChromaDB (`make index`)
-└── inspect.py      # Inspect stored vectors/docs (`make inspect-documents` / `inspect-embeddings`)
-data/
-├── products.json   # Canonical product catalog (system of record, 20 products)
-└── checkpoints.db  # SQLite checkpointer (gitignored, mounted in Docker)
-tests/
-├── test_main.py    # 10 integration tests (HTTP + mocked LLM and vector search)
-├── test_product.py # 9 unit tests (catalog loader + ChromaDB repo with mocked collection)
-└── test_order.py   # 8 unit tests
+├── agent/      graph, skills (nodes), turn runner, confirmation parsing, decision sanitizing, response blocks
+├── llm/        Gemini factory, router, answer writer, prompts, grounding check
+├── order/      pricing (cart + mandate hash), returns policy, fulfilment clock, Postgres repository
+├── product/    catalog loader, hybrid search repository
+├── db/         schema.sql, migrate, grants.sql
+├── session.py  server-issued sessions and LLM budget
+├── rate_limit.py
+└── main.py     FastAPI app factory, endpoints, SSE
+embedding/      offline indexer (catalog → pgvector)
+evaluation/     router + prompt-injection benchmark
+frontend/       React + Vite + Tailwind "Receipt Tape" UI
+tests/          backend tests against a real Postgres
 ```
-
-## Stack
-
-| Component | Technology |
-|-----------|-----------|
-| API framework | FastAPI (async) |
-| Agent orchestration | LangGraph (state graph with 7 nodes, 3 conditional paths) |
-| LLM | OpenAI ChatGPT gpt-4o-mini (via langchain-openai) |
-| RAG retrieval | ChromaDB 1.5.9 (separate container) + OpenAI embeddings (text-embedding-3-small) |
-| Data validation | Pydantic |
-| State persistence | LangGraph SQLite checkpointer (+ InMemorySaver for tests) |
-| Linting & formatting | ruff |
-| Containerization | Docker + docker-compose |
-| Package management | uv |
-
-## Quick start
-
-```bash
-# 1. Set your API key
-cp .env.example .env   # edit with your OPENAI_API_KEY
-
-# 2. Build and run (app on :8000, ChromaDB on :8001)
-make build
-make up                # starts app + chroma with hot reload
-
-# 3. Build the vector index — embeds the catalog into ChromaDB (run once)
-make index             # re-run whenever data/products.json changes
-
-# 4. Test it
-# Open api-requests.http in PyCharm/IntelliJ, select "dev" environment,
-# and click the green ▶ next to each request.
-```
-
-> **Note:** Q&A requires the index. If you skip `make index`, product search has
-> no collection to query. The indexer is a one-off batch job, kept out of the
-> request path so startup stays fast and embeddings are computed exactly once.
-
-API: `http://localhost:8000` | Swagger: `http://localhost:8000/docs`
-
-## Commands
-
-```
-make up                 start app + chroma with hot reload
-make index              build the vector index (embed catalog into ChromaDB)
-make inspect-documents  list stored docs + metadata in ChromaDB
-make inspect-embeddings same, plus a preview of each stored vector
-make down               stop services
-make logs               tail logs
-make test               run tests locally
-make lint               ruff check
-make format             ruff format
-make build              rebuild Docker image
-```
-
-## Skill router evaluation
-
-The skill router is LLM-powered, so accuracy is measured with a frozen test set.
-
-```bash
-make eval   # runs `python -m evaluation.skill_router_eval` — hits real OpenAI API
-```
-
-**Results (gpt-4o-mini, 54 test cases):**
-
-| Skill | Cases | Correct | Accuracy |
-|-------|-------|---------|----------|
-| Q&A   | 17    | 17      | 100%     |
-| Order | 21    | 15      | 71.43%   |
-| Track | 16    | 16      | 100%     |
-| **Total** | **54** | **48** | **88.89%** |
-
-**Main failure pattern — Order → Track (6 cases):**
-
-The router misclassifies order-management intent as tracking when the message contains order-status vocabulary:
-
-```
-"I want to cancel my order"                        expected=order  got=track
-"I want to return my order"                        expected=order  got=track
-"Return the headphones I bought"                   expected=order  got=track
-"I want to cancel order #123"                      expected=order  got=track
-"I want to return the item, what is the status?"   expected=order  got=track
-"I am not happy with my order, I want a refund"    expected=order  got=track
-```
-
-Root cause: the prompt doesn't explicitly distinguish *managing* an order (cancel, return, refund) from *tracking* it (status, ETA, location). A prompt update or few-shot examples would fix this.
-
-## API
-
-```bash
-# Product Q&A
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Tell me about laptops", "session_id": "s1"}'
-
-# Place an order (step 1 - draft)
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "I want to buy a ProBook 15", "session_id": "s2"}'
-
-# Confirm order (step 2)
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "yes", "session_id": "s2"}'
-
-# Track order
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Where is my order?", "session_id": "s2"}'
-```
-
-Or use `api-requests.http` with IntelliJ HTTP Client or `npx httpyac api-requests.http --env dev`.
-
